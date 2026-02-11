@@ -9,18 +9,29 @@ Sentry.init({
   // Setting this option to true will print useful information to the console while you're setting up Sentry.
   debug: false,
 
+  // Capture 100% of sessions with errors
   replaysOnErrorSampleRate: 1.0,
 
-  // This sets the sample rate to be 10%. You may want this to be 100% while
-  // in development and sample at a lower rate in production
-  replaysSessionSampleRate: 0.1,
+  // Capture 100% of all sessions for demo/development (adjust to 0.1-0.2 in production)
+  replaysSessionSampleRate: 1.0,
 
-  // You can remove this option if you're not planning to use the Sentry Session Replay feature:
+  // Session Replay integration with rage click and frustration detection
   integrations: [
     Sentry.replayIntegration({
-      // Additional Replay configuration goes in here, for example:
-      maskAllText: true,
-      blockAllMedia: true,
+      // Unmask text for better observability (mask in production if needed)
+      maskAllText: false,
+      maskAllInputs: true, // Still mask input fields for security
+      blockAllMedia: false,
+
+      // Enable rage click detection (3+ clicks in <500ms)
+      blockClass: 'sentry-block',
+      ignoreClass: 'sentry-ignore',
+
+      // Network details for debugging
+      networkDetailAllowUrls: [window.location.origin],
+      networkCaptureBodies: true,
+      networkResponseHeaders: ['content-type'],
+      networkRequestHeaders: ['content-type'],
     }),
   ],
 });

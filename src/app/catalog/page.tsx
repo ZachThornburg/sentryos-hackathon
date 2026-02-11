@@ -1,12 +1,14 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import * as Sentry from '@sentry/nextjs'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Download, ExternalLink, Settings, FileText, Presentation, Video, Mail, Calculator, Shield, Search, X } from 'lucide-react'
+import { Download, ExternalLink, Settings, FileText, Presentation, Video, Mail, Calculator, Shield, Search, X, User, AlertCircle } from 'lucide-react'
 import Link from 'next/link'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 
 // Types
 type AssetType = 'deck' | 'one-pager' | 'template' | 'demo-script' | 'battle-card' | 'case-study' | 'calculator' | 'guide' | 'email' | 'video'
@@ -350,13 +352,226 @@ const filterCategories = [
   { id: 'profiling', label: 'Profiling', group: 'Product' },
 ]
 
+type UserType = 'AE' | 'CSM' | 'SE' | 'SC' | 'Manager' | null
+
 export default function CatalogPage() {
   const [activeStage, setActiveStage] = useState('qualify')
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedCategories, setSelectedCategories] = useState<string[]>([])
+  const [userType, setUserType] = useState<UserType>(null)
+  const [showUserTypeModal, setShowUserTypeModal] = useState(true)
+  const [searchCount, setSearchCount] = useState(0)
+  const [hasDownloaded, setHasDownloaded] = useState(false)
+  const [showErrorSimulator, setShowErrorSimulator] = useState(false)
+
+  const sessionStartTime = useRef<number>(Date.now())
+  const lastClickTime = useRef<number>(0)
+  const clickCount = useRef<number>(0)
+  const clickTimer = useRef<NodeJS.Timeout | null>(null)
 
   // Determine if we should search across all stages
   const isSearching = searchQuery.trim() !== '' || selectedCategories.length > 0
+
+  // Set user context in Sentry when user type is selected
+  useEffect(() => {
+    if (userType) {
+      Sentry.setUser({
+        id: `user-${Date.now()}`,
+        username: `${userType}-user`,
+        userType: userType,
+      })
+      Sentry.setTag('user_type', userType)
+
+      Sentry.captureMessage('User started session', {
+        level: 'info',
+        tags: { user_type: userType, event: 'session_start' }
+      })
+
+      Sentry.metrics.increment('catalog.session.started', 1, {
+        tags: { user_type: userType }
+      })
+    }
+  }, [userType])
+
+  // Track session duration on unmount
+  useEffect(() => {
+    return () => {
+      if (userType) {
+        const sessionDuration = (Date.now() - sessionStartTime.current) / 1000
+        Sentry.metrics.distribution('catalog.session.duration', sessionDuration, {
+          tags: { user_type: userType },
+          unit: 'second'
+        })
+      }
+    }
+  }, [userType])
+
+  // Rage click detection
+  const detectRageClick = () => {
+    const now = Date.now()
+    if (now - lastClickTime.current < 500) {
+      clickCount.current++
+      if (clickCount.current >= 3) {
+        Sentry.captureMessage('Rage click detected', {
+          level: 'warning',
+          tags: {
+            user_type: userType || 'unknown',
+            frustration: 'rage_click',
+            location: window.location.pathname
+          }
+        })
+        Sentry.metrics.increment('catalog.frustration.rage_click', 1, {
+          tags: { user_type: userType || 'unknown' }
+        })
+        clickCount.current = 0
+      }
+    } else {
+      clickCount.current = 1
+    }
+    lastClickTime.current = now
+
+    if (clickTimer.current) clearTimeout(clickTimer.current)
+    clickTimer.current = setTimeout(() => {
+      clickCount.current = 0
+    }, 1000)
+  }
+
+  // Track search events
+  const handleSearch = (query: string) => {
+    setSearchQuery(query)
+    if (query.trim()) {
+      setSearchCount(prev => prev + 1)
+
+      Sentry.captureMessage('User searched catalog', {
+        level: 'info',
+        tags: {
+          user_type: userType || 'unknown',
+          search_query: query
+        }
+      })
+
+      Sentry.metrics.increment('catalog.search.performed', 1, {
+        tags: { user_type: userType || 'unknown' }
+      })
+    }
+  }
+
+  // Track asset downloads/clicks
+  const handleAssetClick = (asset: Asset) => {
+    detectRageClick()
+
+    const timeSinceSession = (Date.now() - sessionStartTime.current) / 1000
+
+    // Track time to first download
+    if (!hasDownloaded) {
+      setHasDownloaded(true)
+      Sentry.metrics.distribution('catalog.time_to_first_download', timeSinceSession, {
+        tags: { user_type: userType || 'unknown' },
+        unit: 'second'
+      })
+
+      Sentry.captureMessage('First asset downloaded', {
+        level: 'info',
+        tags: {
+          user_type: userType || 'unknown',
+          asset_id: asset.id,
+          asset_title: asset.title,
+          asset_type: asset.type,
+          stage: asset.stage
+        },
+        extra: {
+          time_to_first_download_seconds: timeSinceSession,
+          search_count_before_download: searchCount
+        }
+      })
+    }
+
+    // Track search to download ratio
+    if (searchCount > 0) {
+      Sentry.metrics.gauge('catalog.searches_before_download', searchCount, {
+        tags: { user_type: userType || 'unknown', asset_type: asset.type }
+      })
+    }
+
+    // Track asset click
+    Sentry.captureMessage('Asset clicked', {
+      level: 'info',
+      tags: {
+        user_type: userType || 'unknown',
+        asset_id: asset.id,
+        asset_title: asset.title,
+        asset_type: asset.type,
+        asset_stage: asset.stage
+      }
+    })
+
+    Sentry.metrics.increment('catalog.asset.clicked', 1, {
+      tags: {
+        user_type: userType || 'unknown',
+        asset_id: asset.id,
+        asset_type: asset.type,
+        stage: asset.stage
+      }
+    })
+  }
+
+  // Error simulation functions
+  const simulateSearchError = () => {
+    const error = new Error('Search functionality temporarily unavailable')
+    Sentry.captureException(error, {
+      level: 'error',
+      tags: {
+        user_type: userType || 'unknown',
+        error_type: 'search_error',
+        simulated: 'true'
+      },
+      extra: {
+        search_query: searchQuery,
+        context: 'User attempted to search but service failed'
+      }
+    })
+    alert('Simulated Error: Search failed')
+  }
+
+  const simulateDownloadError = () => {
+    const error = new Error('Asset download failed - file not accessible')
+    Sentry.captureException(error, {
+      level: 'error',
+      tags: {
+        user_type: userType || 'unknown',
+        error_type: 'download_error',
+        simulated: 'true'
+      }
+    })
+    alert('Simulated Error: Download failed')
+  }
+
+  const simulateTabLoadError = () => {
+    const error = new Error('Tab content failed to load - timeout error')
+    Sentry.captureException(error, {
+      level: 'error',
+      tags: {
+        user_type: userType || 'unknown',
+        error_type: 'tab_load_error',
+        simulated: 'true',
+        stage: activeStage
+      }
+    })
+    alert('Simulated Error: Tab failed to load')
+  }
+
+  const simulateButtonClickError = () => {
+    const error = new Error('Button click handler failed - undefined function')
+    Sentry.captureException(error, {
+      level: 'error',
+      tags: {
+        user_type: userType || 'unknown',
+        error_type: 'ui_interaction_error',
+        simulated: 'true'
+      }
+    })
+    alert('Simulated Error: Button click failed')
+  }
 
   // Filter assets by stage (or all stages if searching), search, and categories
   const currentAssets = sampleAssets.filter(asset => {
@@ -401,6 +616,36 @@ export default function CatalogPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#0f0c14] via-[#1e1a2a] to-[#2a2438]">
+      {/* User Type Selection Modal */}
+      {showUserTypeModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100]">
+          <Card className="bg-[#2a2438] border-[#362552] p-8 max-w-md w-full mx-4">
+            <h2 className="text-2xl font-bold text-[#e8e4f0] mb-2">Welcome to GTM Asset Catalog</h2>
+            <p className="text-[#9086a3] mb-6">Select your role to get started</p>
+
+            <div className="space-y-3">
+              {(['AE', 'CSM', 'SE', 'SC', 'Manager'] as UserType[]).map((type) => (
+                <Button
+                  key={type}
+                  onClick={() => {
+                    setUserType(type)
+                    setShowUserTypeModal(false)
+                  }}
+                  className="w-full bg-[#7553ff] hover:bg-[#8c6fff] text-white justify-start"
+                >
+                  <User className="w-4 h-4 mr-2" />
+                  {type === 'AE' && 'Account Executive'}
+                  {type === 'CSM' && 'Customer Success Manager'}
+                  {type === 'SE' && 'Solutions Engineer'}
+                  {type === 'SC' && 'Solutions Consultant'}
+                  {type === 'Manager' && 'Manager'}
+                </Button>
+              ))}
+            </div>
+          </Card>
+        </div>
+      )}
+
       {/* Header */}
       <header className="border-b border-[#362552] bg-[#1e1a2a]/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="container mx-auto px-6 py-4">
@@ -418,18 +663,78 @@ export default function CatalogPage() {
                 </p>
               </div>
             </div>
-            <Link href="/admin">
+            <div className="flex items-center gap-3">
+              {userType && (
+                <Badge className="bg-[#7553ff]/20 text-[#7553ff] border-[#7553ff]/30">
+                  <User className="w-3 h-3 mr-1" />
+                  {userType}
+                </Badge>
+              )}
               <Button
                 variant="outline"
-                className="border-[#362552] text-[#e8e4f0] hover:bg-[#2a2438]"
+                size="sm"
+                onClick={() => setShowErrorSimulator(!showErrorSimulator)}
+                className="border-[#ff45a8]/30 text-[#ff45a8] hover:bg-[#ff45a8]/10"
               >
-                <Settings className="w-4 h-4 mr-2" />
-                Admin
+                <AlertCircle className="w-4 h-4 mr-2" />
+                Error Simulator
               </Button>
-            </Link>
+              <Link href="/admin">
+                <Button
+                  variant="outline"
+                  className="border-[#362552] text-[#e8e4f0] hover:bg-[#2a2438]"
+                >
+                  <Settings className="w-4 h-4 mr-2" />
+                  Admin
+                </Button>
+              </Link>
+            </div>
           </div>
         </div>
       </header>
+
+      {/* Error Simulator Panel */}
+      {showErrorSimulator && (
+        <div className="bg-[#ff45a8]/10 border-b border-[#ff45a8]/30">
+          <div className="container mx-auto px-6 py-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm text-[#ff45a8] font-semibold">Simulate Errors:</span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={simulateSearchError}
+                className="border-[#ff45a8]/30 text-[#e8e4f0] hover:bg-[#ff45a8]/20 text-xs"
+              >
+                Search Error
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={simulateDownloadError}
+                className="border-[#ff45a8]/30 text-[#e8e4f0] hover:bg-[#ff45a8]/20 text-xs"
+              >
+                Download Error
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={simulateTabLoadError}
+                className="border-[#ff45a8]/30 text-[#e8e4f0] hover:bg-[#ff45a8]/20 text-xs"
+              >
+                Tab Load Error
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={simulateButtonClickError}
+                className="border-[#ff45a8]/30 text-[#e8e4f0] hover:bg-[#ff45a8]/20 text-xs"
+              >
+                Button Click Error
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Stage Tabs */}
       <div className="border-b border-[#362552] bg-[#1e1a2a]/50 backdrop-blur-sm sticky top-[73px] z-40">
@@ -465,7 +770,7 @@ export default function CatalogPage() {
               type="text"
               placeholder="Search assets by title, description, or tags..."
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(e) => handleSearch(e.target.value)}
               className="pl-10 pr-10 bg-[#2a2438] border-[#362552] text-[#e8e4f0] placeholder:text-[#9086a3] h-12"
             />
             {searchQuery && (
@@ -587,6 +892,7 @@ export default function CatalogPage() {
                   {/* Action Button */}
                   <Button
                     className="w-full bg-[#7553ff] hover:bg-[#8c6fff] text-white"
+                    onClick={() => handleAssetClick(asset)}
                     asChild
                   >
                     <a href={asset.link} target="_blank" rel="noopener noreferrer">
