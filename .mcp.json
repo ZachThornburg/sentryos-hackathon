@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sentry": {
+      "url": "https://mcp.sentry.dev/mcp?experimental=1",
+      "type": "sse"
+    }
+  }
+}
