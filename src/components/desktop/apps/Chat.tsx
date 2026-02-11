@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
+import * as Sentry from '@sentry/nextjs'
 import { Send, Bot, User, Loader2, Wrench, Search, Globe, FileText, Terminal } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -59,6 +60,23 @@ export function Chat() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
+  // Log chat component mount
+  useEffect(() => {
+    Sentry.captureMessage('Chat component mounted', {
+      level: 'info',
+      tags: { component: 'chat' }
+    })
+    Sentry.metrics.increment('chat.component.mounted', 1)
+
+    return () => {
+      Sentry.captureMessage('Chat component unmounted', {
+        level: 'info',
+        tags: { component: 'chat' },
+        extra: { total_messages: messages.length }
+      })
+    }
+  }, [])
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
@@ -71,12 +89,29 @@ export function Chat() {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
+    const messageStartTime = Date.now()
     const userMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
       content: input.trim(),
       timestamp: new Date()
     }
+
+    // Log user message submission
+    Sentry.captureMessage('User message submitted', {
+      level: 'info',
+      tags: { interaction: 'chat_message' },
+      extra: {
+        message_length: userMessage.content.length,
+        conversation_length: messages.length + 1
+      }
+    })
+    Sentry.metrics.increment('chat.messages.sent', 1, {
+      tags: { role: 'user' }
+    })
+    Sentry.metrics.gauge('chat.message.input_length', userMessage.content.length, {
+      tags: { unit: 'characters' }
+    })
 
     setMessages(prev => [...prev, userMessage])
     setInput('')
@@ -98,6 +133,14 @@ export function Chat() {
       })
 
       if (!response.ok) {
+        Sentry.captureMessage('Chat API request failed', {
+          level: 'error',
+          tags: { error_type: 'api_error' },
+          extra: { status: response.status, statusText: response.statusText }
+        })
+        Sentry.metrics.increment('chat.api.client_errors', 1, {
+          tags: { status: response.status.toString() }
+        })
         throw new Error('Failed to get response')
       }
 
@@ -175,8 +218,30 @@ export function Chat() {
       // If no content was streamed, remove the placeholder
       if (!streamingContent) {
         setMessages(prev => prev.filter(msg => msg.id !== streamingMessageId))
+      } else {
+        // Log successful message completion
+        const duration = (Date.now() - messageStartTime) / 1000
+        Sentry.captureMessage('Chat message completed', {
+          level: 'info',
+          extra: {
+            duration_seconds: duration,
+            response_length: streamingContent.length
+          }
+        })
+        Sentry.metrics.distribution('chat.message.duration', duration, {
+          tags: { status: 'success' },
+          unit: 'second'
+        })
+        Sentry.metrics.gauge('chat.message.response_length', streamingContent.length, {
+          tags: { unit: 'characters' }
+        })
       }
-    } catch {
+    } catch (error) {
+      Sentry.captureException(error, {
+        level: 'error',
+        tags: { component: 'chat', error_location: 'message_handler' }
+      })
+      Sentry.metrics.increment('chat.messages.errors', 1)
       const errorMessage: Message = {
         id: crypto.randomUUID(),
         role: 'assistant',

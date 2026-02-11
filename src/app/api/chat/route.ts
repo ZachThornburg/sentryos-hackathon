@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
+import * as Sentry from '@sentry/nextjs'
 
 const SYSTEM_PROMPT = `You are a helpful personal assistant designed to help with general research, questions, and tasks.
 
@@ -22,10 +23,28 @@ interface MessageInput {
 }
 
 export async function POST(request: Request) {
+  const requestStartTime = Date.now()
+
   try {
+    // Log API request received
+    Sentry.captureMessage('Chat API request received', {
+      level: 'info',
+      tags: { endpoint: 'chat' }
+    })
+    Sentry.metrics.increment('chat.api.requests', 1, {
+      tags: { endpoint: 'chat' }
+    })
+
     const { messages } = await request.json() as { messages: MessageInput[] }
 
     if (!messages || !Array.isArray(messages)) {
+      Sentry.captureMessage('Invalid messages payload', {
+        level: 'warning',
+        tags: { error_type: 'validation' }
+      })
+      Sentry.metrics.increment('chat.api.errors', 1, {
+        tags: { error_type: 'invalid_payload' }
+      })
       return new Response(
         JSON.stringify({ error: 'Messages array is required' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } }
@@ -35,11 +54,26 @@ export async function POST(request: Request) {
     // Get the last user message
     const lastUserMessage = messages.filter(m => m.role === 'user').pop()
     if (!lastUserMessage) {
+      Sentry.captureMessage('No user message in conversation', {
+        level: 'warning',
+        tags: { error_type: 'validation' }
+      })
+      Sentry.metrics.increment('chat.api.errors', 1, {
+        tags: { error_type: 'no_user_message' }
+      })
       return new Response(
         JSON.stringify({ error: 'No user message found' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } }
       )
     }
+
+    // Log conversation metrics
+    Sentry.metrics.gauge('chat.conversation.length', messages.length, {
+      tags: { unit: 'messages' }
+    })
+    Sentry.metrics.gauge('chat.message.length', lastUserMessage.content.length, {
+      tags: { unit: 'characters' }
+    })
 
     // Build conversation context
     const conversationContext = messages
@@ -51,8 +85,18 @@ export async function POST(request: Request) {
       ? `${SYSTEM_PROMPT}\n\nPrevious conversation:\n${conversationContext}\n\nUser: ${lastUserMessage.content}`
       : `${SYSTEM_PROMPT}\n\nUser: ${lastUserMessage.content}`
 
+    // Log query start
+    Sentry.captureMessage('Starting Claude query', {
+      level: 'info',
+      tags: { query_type: 'streaming' },
+      extra: { message_count: messages.length }
+    })
+
     // Create a streaming response
     const encoder = new TextEncoder()
+    let toolUsageCount = 0
+    let streamedChars = 0
+
     const stream = new ReadableStream({
       async start(controller) {
         try {
@@ -77,6 +121,7 @@ export async function POST(request: Request) {
               const event = message.event
               // Handle content block delta events for text streaming
               if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+                streamedChars += event.delta.text.length
                 controller.enqueue(encoder.encode(
                   `data: ${JSON.stringify({ type: 'text_delta', text: event.delta.text })}\n\n`
                 ))
@@ -89,6 +134,14 @@ export async function POST(request: Request) {
               if (Array.isArray(content)) {
                 for (const block of content) {
                   if (block.type === 'tool_use') {
+                    toolUsageCount++
+                    Sentry.captureMessage('Tool usage in chat', {
+                      level: 'info',
+                      tags: { tool_name: block.name }
+                    })
+                    Sentry.metrics.increment('chat.tools.used', 1, {
+                      tags: { tool_name: block.name }
+                    })
                     controller.enqueue(encoder.encode(
                       `data: ${JSON.stringify({ type: 'tool_start', tool: block.name })}\n\n`
                     ))
@@ -99,6 +152,10 @@ export async function POST(request: Request) {
 
             // Send tool progress updates
             if (message.type === 'tool_progress') {
+              Sentry.metrics.distribution('chat.tools.duration', message.elapsed_time_seconds, {
+                tags: { tool_name: message.tool_name },
+                unit: 'second'
+              })
               controller.enqueue(encoder.encode(
                 `data: ${JSON.stringify({ type: 'tool_progress', tool: message.tool_name, elapsed: message.elapsed_time_seconds })}\n\n`
               ))
@@ -106,6 +163,22 @@ export async function POST(request: Request) {
 
             // Signal completion
             if (message.type === 'result' && message.subtype === 'success') {
+              const duration = (Date.now() - requestStartTime) / 1000
+              Sentry.captureMessage('Chat query completed successfully', {
+                level: 'info',
+                extra: {
+                  duration_seconds: duration,
+                  tools_used: toolUsageCount,
+                  characters_streamed: streamedChars
+                }
+              })
+              Sentry.metrics.distribution('chat.query.duration', duration, {
+                tags: { status: 'success' },
+                unit: 'second'
+              })
+              Sentry.metrics.gauge('chat.response.length', streamedChars, {
+                tags: { unit: 'characters' }
+              })
               controller.enqueue(encoder.encode(
                 `data: ${JSON.stringify({ type: 'done' })}\n\n`
               ))
@@ -113,6 +186,13 @@ export async function POST(request: Request) {
 
             // Handle errors
             if (message.type === 'result' && message.subtype !== 'success') {
+              Sentry.captureMessage('Chat query failed', {
+                level: 'error',
+                tags: { result_type: message.subtype }
+              })
+              Sentry.metrics.increment('chat.query.failures', 1, {
+                tags: { result_type: message.subtype }
+              })
               controller.enqueue(encoder.encode(
                 `data: ${JSON.stringify({ type: 'error', message: 'Query did not complete successfully' })}\n\n`
               ))
@@ -123,6 +203,12 @@ export async function POST(request: Request) {
           controller.close()
         } catch (error) {
           console.error('Stream error:', error)
+          Sentry.captureException(error, {
+            level: 'error',
+            tags: { error_location: 'stream' },
+            extra: { message_count: messages.length }
+          })
+          Sentry.metrics.increment('chat.stream.errors', 1)
           controller.enqueue(encoder.encode(
             `data: ${JSON.stringify({ type: 'error', message: 'Stream error occurred' })}\n\n`
           ))
@@ -140,6 +226,13 @@ export async function POST(request: Request) {
     })
   } catch (error) {
     console.error('Chat API error:', error)
+    Sentry.captureException(error, {
+      level: 'error',
+      tags: { error_location: 'api_handler' }
+    })
+    Sentry.metrics.increment('chat.api.errors', 1, {
+      tags: { error_type: 'server_error' }
+    })
 
     return new Response(
       JSON.stringify({ error: 'Failed to process chat request. Check server logs for details.' }),

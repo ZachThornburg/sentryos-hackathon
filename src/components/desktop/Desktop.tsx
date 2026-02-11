@@ -7,7 +7,8 @@ import { DesktopIcon } from './DesktopIcon'
 import { Notepad } from './apps/Notepad'
 import { FolderView, FolderItem } from './apps/FolderView'
 import { Chat } from './apps/Chat'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import * as Sentry from '@sentry/nextjs'
 
 const INSTALL_GUIDE_CONTENT = `# SentryOS Install Guide
 
@@ -58,7 +59,36 @@ function DesktopContent() {
   const { windows, openWindow } = useWindowManager()
   const [selectedIcon, setSelectedIcon] = useState<string | null>(null)
 
+  // Log desktop initialization
+  useEffect(() => {
+    Sentry.captureMessage('SentryOS Desktop initialized', {
+      level: 'info',
+      tags: { component: 'desktop' }
+    })
+    Sentry.metrics.increment('desktop.initialized', 1)
+
+    // Track session duration
+    const sessionStart = Date.now()
+    return () => {
+      const sessionDuration = (Date.now() - sessionStart) / 1000
+      Sentry.captureMessage('Desktop session ended', {
+        level: 'info',
+        extra: { session_duration_seconds: sessionDuration }
+      })
+      Sentry.metrics.distribution('desktop.session.duration', sessionDuration, {
+        unit: 'second'
+      })
+    }
+  }, [])
+
   const openInstallGuide = () => {
+    Sentry.captureMessage('Install Guide opened', {
+      level: 'info',
+      tags: { icon_type: 'document' }
+    })
+    Sentry.metrics.increment('desktop.icons.clicked', 1, {
+      tags: { icon: 'install-guide' }
+    })
     openWindow({
       id: 'install-guide',
       title: 'Install Guide.md',
@@ -76,6 +106,13 @@ function DesktopContent() {
   }
 
   const openChatWindow = () => {
+    Sentry.captureMessage('Chat window opened', {
+      level: 'info',
+      tags: { icon_type: 'chat' }
+    })
+    Sentry.metrics.increment('desktop.icons.clicked', 1, {
+      tags: { icon: 'chat' }
+    })
     openWindow({
       id: 'chat',
       title: 'SentryOS Chat',
@@ -93,6 +130,14 @@ function DesktopContent() {
   }
 
   const openAgentsFolder = () => {
+    Sentry.captureMessage('Agents folder opened', {
+      level: 'info',
+      tags: { icon_type: 'folder' }
+    })
+    Sentry.metrics.increment('desktop.icons.clicked', 1, {
+      tags: { icon: 'agents-folder' }
+    })
+
     const agentsFolderItems: FolderItem[] = []
 
     openWindow({
